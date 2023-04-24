@@ -1,0 +1,96 @@
+IMAGE=gcr.io/nettargets-research-cloud/cellbox:latest
+CONTAINER=cellbox__${USER}_
+
+CRED_FILE=$(HOME)/.config/gcp_sa_key.json
+
+ifeq ($(shell which nvidia-smi > /dev/null && echo -n yes),yes)
+GPU_OPT=--gpus all
+endif
+
+ifeq ($(shell test -e host.txt && echo -n yes),yes)
+IPADDR=$(shell cat host.txt)
+else 
+#IPADDR=$(shell dig +short myip.opendns.com @resolver1.opendns.com)
+IPADDR=$(shell hostname -I | awk '{print $$1}')
+endif
+
+JUP_PORT=$(shell docker ps | grep ${CONTAINER} | grep -o '[0-9]\+->8888' | grep -o '^[0-9]\+' )
+APP_PORT=$(shell docker ps | grep ${CONTAINER} | grep -o '[0-9]\+->5000' | grep -o '^[0-9]\+' )
+
+UID=$(shell id -u)
+GID=$(shell id -g)
+GID_DOCKER=$(shell getent group docker | awk -F: '{printf $$3}')
+
+VOLS= --volume $(HOME):$(HOME) --volume /home/dvc:/home/dvc \
+	--volume "/var/run/docker.sock:/var/run/docker.sock:rw" \
+	--volume "/etc/group:/etc/group:ro" \
+	--volume "/etc/passwd:/etc/passwd:ro" \
+	--volume "/etc/shadow:/etc/shadow:ro" \
+	--volume $(abspath .)/.bashrc:$(HOME)/.bashrc \
+	--user ${UID}:${GID} --group-add ${GID_DOCKER}
+
+ENV_OPTS= -e GOOGLE_APPLICATION_CREDENTIALS=${CRED_FILE} \
+          -e HOME=$(HOME) \
+          -e CUDA_LAUNCH_BLOCKING=1 \
+          -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+
+JPY_WORKDIR=$(abspath ..)
+
+all: run_jupyter
+
+test:
+	echo $(workdir)
+
+build: 
+	@echo $$GITHUB_ACCESS_TOKEN > github_token.txt && \
+	DOCKER_BUILDKIT=1 docker build --progress=plain --secret id=github_token,src=${PWD}/github_token.txt -t ${IMAGE} .
+
+push:
+	docker push ${IMAGE}
+
+run_jupyter: 
+	docker run --privileged=true -it --rm -P -d -w=$(HOME) ${GPU_OPT} ${VOLS} ${ENV_OPTS} \
+			--name ${CONTAINER} ${IMAGE} \
+			bash -c "source /etc/bash.bashrc && SHELL=/bin/bash jupyter lab \
+			--notebook-dir=${JPY_WORKDIR} --ip 0.0.0.0 --no-browser \
+			--allow-root >&/tmp/jupyter.log"
+
+run_bash: 
+	docker run --privileged=true -it --rm -P -w=$(HOME) ${GPU_OPT} ${VOLS} ${ENV_OPTS} \
+			--name ${CONTAINER} ${IMAGE} bash 
+
+run_bash_noname: 
+	mkdir -p ~/tmp/repro01 && \
+	docker run -it --rm -P -w=$(HOME) ${GPU_OPT} \
+	--volume $(HOME):$(HOME) \
+	--volume $(HOME)/tmp/repro01:$(HOME)/NTCRS-37_Melanoma/suhaib_v2/repro \
+	--volume /home/dvc:/home/dvc \
+	--volume "/var/run/docker.sock:/var/run/docker.sock:rw" \
+	--volume "/etc/group:/etc/group:ro" \
+	--volume "/etc/passwd:/etc/passwd:ro" \
+	--volume "/etc/shadow:/etc/shadow:ro" \
+	--user ${UID}:${GID} \
+	--group-add ${GID_DOCKER} \
+	${ENV_OPTS} ${IMAGE} bash
+	#bash -c "cd /home/jehoons/NTCRS-37_Melanoma/suhaib_v2 && dvc repro -sf Dataset"
+
+stop: 
+	@docker stop ${CONTAINER}
+
+exec_bash: 
+	@docker exec -it ${CONTAINER} bash
+
+url:
+	$(eval JUP_PORT=$(shell docker port ${CONTAINER} | \
+		grep '8888/tcp -> 0.0.0.0' | grep -o ':[0-9]\+' | grep -o '[0-9]\+'))
+	$(eval JUP_TOKEN=$(shell docker exec -it ${CONTAINER} jupyter lab list | \
+		grep -o 'token=[[:alnum:]]*'))
+	$(eval WEB_URL='http://${IPADDR}:${JUP_PORT}/?${JUP_TOKEN}')
+	$(eval WEB_URL2='http://${IPADDR2}:${JUP_PORT}/?${JUP_TOKEN}')
+	@echo
+	@echo 'IP address for Jupyter lab:'
+	@echo ${WEB_URL}
+	@echo 
+
+clean: 
+	find . -name "*~" -exec rm {} \;
